@@ -6,10 +6,19 @@ on:
   pull_request:
     branches: ["main"]
 
+# Cada run compila y sube los binarios como artefacto (Actions -> run -> Artifacts).
+# En push a main ademas crea la Release v<FIRMWARE_VERSION> con esos binarios,
+# salvo que ya exista (hay que subir FIRMWARE_VERSION para publicar otra).
+#
+# Se compila con secrets.h.template: un equipo nuevo arranca en el portal de
+# Setup y ahi se configura; un equipo ya configurado conserva su NVS al actualizar.
+
 jobs:
   build:
     name: Compile ESP32 firmware
     runs-on: ubuntu-latest
+    permissions:
+      contents: write   # necesario para crear la Release
 
     steps:
       - uses: actions/checkout@v4
@@ -42,3 +51,77 @@ jobs:
         if: success()
         run: |
           pio run -e esp32_usb 2>&1 | grep -E "RAM:|Flash:" || true
+
+      - name: Package binaries
+        id: pkg
+        run: |
+          VERSION=$(grep -oP 'const String FIRMWARE_VERSION = "\K[^"]+' src/proxy_operativo.hpp)
+          BUILD=.pio/build/esp32_usb
+          DIST=dist
+          NAME=modbusproxy-$VERSION
+          mkdir -p $DIST
+
+          # Offsets de flasheo tal y como los usa PlatformIO (bootloader, particiones, boot_app0, app)
+          META=$(pio project metadata -e esp32_usb --json-output)
+          FLASH_ARGS=$(echo "$META" | jq -r --arg app "$BUILD/firmware.bin" \
+            '.esp32_usb.extra | ([.flash_images[] | .offset, .path] + [.application_offset, $app]) | join(" ")')
+          echo "Flash layout: $FLASH_ARGS"
+
+          # Imagen unica para flashear un ESP32 vacio en 0x0
+          ~/.platformio/penv/bin/python ~/.platformio/packages/tool-esptoolpy/esptool.py \
+            --chip esp32 merge_bin -o $DIST/$NAME-factory.bin $FLASH_ARGS
+
+          cp $BUILD/firmware.bin   $DIST/$NAME-firmware.bin     # OTA / actualizacion USB en 0x10000
+          cp $BUILD/bootloader.bin $DIST/$NAME-bootloader.bin   # 0x1000
+          cp $BUILD/partitions.bin $DIST/$NAME-partitions.bin   # 0x8000
+          (cd $DIST && sha256sum *.bin > $NAME-sha256.txt)
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "name=$NAME"       >> "$GITHUB_OUTPUT"
+          ls -la $DIST
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.name }}-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error
+
+      - name: Create release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.pkg.outputs.version }}
+          NAME: ${{ steps.pkg.outputs.name }}
+        run: |
+          TAG="v$VERSION"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::notice::La release $TAG ya existe. Sube FIRMWARE_VERSION para publicar una nueva."
+            exit 0
+          fi
+
+          cat > notes.md <<EOF
+          ## Binarios
+
+          | Fichero | Uso |
+          |---|---|
+          | \`$NAME-firmware.bin\` | Actualizar un equipo ya instalado: OTA (\`espota\`) o USB en \`0x10000\` |
+          | \`$NAME-factory.bin\` | ESP32 nuevo / vacío: imagen completa a flashear en \`0x0\` |
+          | \`$NAME-bootloader.bin\` / \`$NAME-partitions.bin\` | Flasheo por partes (\`0x1000\` / \`0x8000\`) |
+          | \`$NAME-sha256.txt\` | Checksums |
+
+          Flasheo de un equipo nuevo:
+
+          \`\`\`bash
+          esptool.py --chip esp32 write_flash 0x0 $NAME-factory.bin
+          \`\`\`
+
+          Compilado con los valores por defecto de \`secrets.h.template\`. Un equipo nuevo arranca en **Modo Setup** (AP WiFi abierto \`modbusproxy-$VERSION\`, portal en \`192.168.1.1\`) para configurarlo. Un equipo ya configurado conserva su configuración (NVS) al actualizar. Contraseña OTA inicial de un equipo nuevo: \`tu_password_ota\` — cámbiala en \`/config\`.
+
+          EOF
+
+          gh release create "$TAG" dist/*.bin dist/*.txt \
+            --target "$GITHUB_SHA" \
+            --title "modbusproxy $VERSION" \
+            --notes-file notes.md \
+            --generate-notes
