@@ -36,7 +36,7 @@ jobs:
           python-version: "3.x"
 
       - name: Install PlatformIO
-        run: pip install platformio
+        run: pip install platformio "esptool==4.9.0"   # esptool: misma version que trae PlatformIO, para merge_bin
 
       - name: Generate secrets.h from template
         run: cp src/secrets.h.template src/secrets.h
@@ -68,8 +68,7 @@ jobs:
           echo "Flash layout: $FLASH_ARGS"
 
           # Imagen unica para flashear un ESP32 vacio en 0x0
-          ~/.platformio/penv/bin/python ~/.platformio/packages/tool-esptoolpy/esptool.py \
-            --chip esp32 merge_bin -o $DIST/$NAME-factory.bin $FLASH_ARGS
+          python -m esptool --chip esp32 merge_bin -o $DIST/$NAME-factory.bin $FLASH_ARGS
 
           cp $BUILD/firmware.bin   $DIST/$NAME-firmware.bin     # OTA / actualizacion USB en 0x10000
           cp $BUILD/bootloader.bin $DIST/$NAME-bootloader.bin   # 0x1000
