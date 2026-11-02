@@ -56,10 +56,10 @@ static void handleSetupRoot() {
     html += F("h3{color:#a0c4ff;border-bottom:1px solid #222;padding-bottom:6px;margin-top:28px;}");
     html += F(".form-group{margin-bottom:16px;}");
     html += F("label.lbl{display:block;font-size:13px;color:#aaa;margin-bottom:5px;font-weight:600;}");
-    html += F("input[type=text],input[type=password],input[type=number]");
+    html += F("input[type=text],input[type=password],input[type=number],select");
     html += F("{width:100%;padding:9px 12px;background:#1e1e1e;border:1px solid #333;");
     html += F("color:#e0e0e0;border-radius:5px;font-size:14px;}");
-    html += F("input:focus{outline:none;border-color:#4da6ff;box-shadow:0 0 0 2px rgba(77,166,255,.2);}");
+    html += F("input:focus,select:focus{outline:none;border-color:#4da6ff;box-shadow:0 0 0 2px rgba(77,166,255,.2);}");
     html += F(".radio-group{display:flex;gap:20px;margin-top:4px;flex-wrap:wrap;}");
     html += F(".radio-group label{display:flex;align-items:center;gap:6px;font-size:14px;");
     html += F("color:#e0e0e0;font-weight:400;cursor:pointer;}");
@@ -196,6 +196,9 @@ static void handleSetupRoot() {
     html += "</label><input type='number' id='modbusPort' name='modbusPort' min='1' max='65535' value='";
     html += String(cfg.modbusPort);
     html += F("'></div>");
+
+    // ---- Dispositivo destino / test de arranque (issue #12) ----
+    appendTargetConfigForm(html, "lbl");
 
     html += "<button type='submit' class='btn-save'>";
     html += L->setup_save_btn;
@@ -349,6 +352,10 @@ static void handleSetupSave() {
 
     int port = setupWebServer.arg("modbusPort").toInt();
     if (port > 0 && port <= 65535) p.putUShort("modbusPort", (uint16_t)port);
+
+    // Dispositivo destino / test de arranque: mismos campos que /config
+    readTargetConfigArgs(setupWebServer);
+    saveTargetConfig(p);
 
     p.putBool("runSetup", false);
     p.end();

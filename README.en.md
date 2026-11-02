@@ -1,4 +1,4 @@
-# 🔋 ESP32 Modbus TCP Proxy & Multiplexer for Huawei EMMA & SUN2000 (v6.0-0)
+# 🔋 ESP32 Modbus TCP Proxy & Multiplexer for Huawei EMMA & SUN2000 (v6.1-0)
 
 This repository contains industrial-grade firmware developed for **ESP32** (optimized for wired connection via the native Ethernet stack of the LAN8720 chip on WT32-ETH01 boards, or via its internal WiFi antenna). The device acts as a **network shield, transparent on-demand proxy, and Modbus TCP channel multiplexer**.
 
@@ -150,7 +150,14 @@ SERVIDORES = {
 
 ## 🚀 Version History and Changelog
 
-### 🟢 Version 6.0-0 (Current)
+### 🟢 Version 6.1-0 (Current)
+
+* **Configurable Test Target (issue #12):** The boot Modbus check is no longer hard-wired to the EMMA. In `/config` and in the Setup portal, inside "Modbus TCP target", you choose the device type (`EMMA`, `SUN2000` or `Custom`), enable or disable the check and set the 4 request fields: Unit ID, function, start register and number of registers. With Custom all of them are free and the web warns that they are the user's responsibility.
+* **Persistence and migration:** Values are stored in NVS. When upgrading from 6.0-0 they are initialised with the EMMA ones (`0 / FC03 / 30000 / 15`, check enabled), so behaviour is unchanged until they are modified.
+* **Per-function validation:** The check accepts the normal reply of the requested function or its exception (`FC | 0x80`), and parsing the reply text is bounds-checked.
+* **`/api/status`** adds `target_profile`, `startup_check`, `test_unit_id`, `test_function`, `test_register` and `test_reg_count`.
+
+### 🔵 Version 6.0-0
 
 * **Multilingual web interface (i18n):** The proxy's web interface now supports multiple languages dynamically. The user can select the language from the Settings page without needing to recompile the firmware. The chosen language is saved to the ESP32's NVS and persists across reboots.
 * **Included languages:** Spanish (default), English, and German. All three languages cover 100% of the interface texts: setup portal, dashboard, Modbus log, settings page, shutdown page, and reboot page.
@@ -184,8 +191,13 @@ The complete behavior of the board and network stack is managed via parameteriza
 * `USE_ETHERNET` (`const bool`): `false` to use the ESP32's internal WiFi antenna. `true` to route all traffic over a physical cable using the native Ethernet stack (e.g. LAN8720).
 * `USE_DHCP` (`const bool`): `true` to request a dynamic IP from the home router. `false` to force the static rescue IP configured in the firmware.
 * `ROTATE_SCREEN` (`const bool`): `true` applies a physical 180-degree rotation to the SH1106 OLED display. `false` keeps the standard orientation.
-* `MODBUS_FIXED_ID` (`const uint8_t`): Unit ID used for the boot test and initial priming (default `0`, corresponding to the EMMA).
-* `MODBUS_TEST_REG` (`const uint16_t`): Modbus register address queried during the boot liveness test (`30000`, Model Name ASCII).
+* **Target device / startup check** (formerly `MODBUS_FIXED_ID` and `MODBUS_TEST_REG`, now configurable in the **Test Target** subsection of "Modbus TCP target", both in `/config` and in the Setup portal — issue #12):
+  * **Device type:** `EMMA`, `SUN2000` or `Custom`. Each profile is a preset of the 4 request fields (`TARGET_PROFILES` table).
+  * **Connection check on boot:** enabled by default. When disabled, Toll 2 is skipped and the gateway opens as soon as the ping succeeds (the ping to the target IP always stays).
+  * **The 4 request fields:** Unit ID, function code, start register and number of registers. EMMA = `0 / FC03 / 30000 / 15`, SUN2000 = `1 / FC03 / 30000 / 15`. With EMMA and SUN2000 only the Unit ID is editable; with Custom, all 4 are free (function 1–127, register and quantity 0–65535) and the web shows a warning that the values are the user's responsibility. The check passes with that function's normal reply or its exception (FC | 0x80). Beware: a write function would modify the device on every attempt.
+  * The Unit ID only affects the check and the menu diagnostics; client requests are forwarded with their own Unit ID.
+  * **Persistence:** stored in NVS, surviving reboots and flashing (USB or OTA). When upgrading from an older firmware, missing values are initialised with the EMMA ones.
+  * `/api/status` exposes `target_profile`, `startup_check`, `test_unit_id`, `test_function`, `test_register` and `test_reg_count`.
 * `RECONNECT_DELAY` (`const uint32_t`): Wait time in milliseconds (`5000` ms) the proxy applies before retrying a connection to Huawei's port 502 if the socket breaks, preventing bans from burst infinite retries (Anti-DDoS).
 * `FIRMWARE_VERSION` (`const String`): Stores the semantic version of the active program, rendered centered in the local menu. Also used as the suffix of the WiFi AP name in Setup Mode (`modbusproxy-<version>`).
 
@@ -202,7 +214,7 @@ To guarantee that Home Assistant or any secondary client never triggers a ban on
 
 ### Toll 2: The Atomic Modbus Priming (Layer 4 / Layer 7)
 
-* **The surgical injection:** Opens a single TCP socket to Huawei's port 502 and injects the exact hexadecimal frame requesting 15 registers starting from address 30000.
+* **The surgical injection:** Opens a single TCP socket to the configured Modbus port and injects the request configured in Test Target (default FC03, 15 registers from 30000 to Unit ID 0, EMMA).
 * **Why 15 registers (Atomic Integrity):** Huawei requires atomic integrity when reading its text strings. The model name at register 30000 occupies exactly 15 registers (30 bytes). If a client requests a shorter length (e.g. 10 registers), Huawei's firmware considers it an attempt to fragment an indivisible variable and responds with data error code `0x03`. Requesting exactly 15 results in clean communication.
 * **Intelligent Liveness Criterion (Exception Detector):** The proxy analyzes the returned function code. If it receives a success (`0x03` or `0x04`), it extracts the text bytes (e.g. `SmartHEMS`) and releases the gateway. But if the device responds with a legitimate Huawei Modbus exception code (`0x83` or `0x84`), the proxy **considers the toll passed anyway**. This is because a device responding with an official Modbus exception is an active device whose firewall is listening correctly.
 
@@ -359,7 +371,7 @@ When NVS is empty (freshly flashed device or erased flash), `runSetup` does not 
 
 When entering Setup Mode, the ESP32:
 
-1. Creates an **open WiFi access point** named `modbusproxy-6.0-0` (no password).
+1. Creates an **open WiFi access point** named `modbusproxy-6.1-0` (no password).
 2. Assigns IP `192.168.1.1` to its own interface.
 3. Any device connecting to that WiFi and opening a browser is **automatically redirected** to the configuration page (captive portal — works just like hotel WiFi).
 4. The wizard lets you configure:
@@ -386,7 +398,7 @@ If you still have access to the proxy's web interface:
 1. Open `http://<proxy_IP>/config` in your browser.
 2. Scroll down to the **Danger Zone** section.
 3. Press **Factory Reset (Enter Setup Mode)** and confirm.
-4. The device restarts and brings up the `modbusproxy-6.0-0` AP.
+4. The device restarts and brings up the `modbusproxy-6.1-0` AP.
 
 ---
 
