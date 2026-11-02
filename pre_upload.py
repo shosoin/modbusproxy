@@ -156,7 +156,7 @@ def ask_for_confirmation(source, target, env):
     # -----------------------------------------------------------------------
     fw_version = extract_first(
         proxy_content,
-        r'const\s+String\s+FIRMWARE_VERSION\s*=\s*"([^"]+)"'
+        r'#define\s+FW_VERSION\s+"([^"]+)"'
     )
 
 
