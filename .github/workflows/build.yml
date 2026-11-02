@@ -7,8 +7,8 @@ on:
     branches: ["main"]
 
 # Cada run compila y sube los binarios como artefacto (Actions -> run -> Artifacts).
-# En push a main ademas crea la Release v<FIRMWARE_VERSION> con esos binarios,
-# salvo que ya exista (hay que subir FIRMWARE_VERSION para publicar otra).
+# En push a main ademas crea la Release v<FW_VERSION> con esos binarios,
+# salvo que ya exista (hay que subir FW_VERSION para publicar otra).
 #
 # Se compila con secrets.h.template: un equipo nuevo arranca en el portal de
 # Setup y ahi se configura; un equipo ya configurado conserva su NVS al actualizar.
@@ -55,7 +55,7 @@ jobs:
       - name: Package binaries
         id: pkg
         run: |
-          VERSION=$(grep -oP 'const String FIRMWARE_VERSION = "\K[^"]+' src/proxy_operativo.hpp)
+          VERSION=$(grep -oP '#define FW_VERSION "\K[^"]+' src/proxy_operativo.hpp)
           BUILD=.pio/build/esp32_usb
           DIST=dist
           NAME=modbusproxy-$VERSION
@@ -95,7 +95,7 @@ jobs:
         run: |
           TAG="v$VERSION"
           if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "::notice::La release $TAG ya existe. Sube FIRMWARE_VERSION para publicar una nueva."
+            echo "::notice::La release $TAG ya existe. Sube FW_VERSION para publicar una nueva."
             exit 0
           fi
 
@@ -108,6 +108,8 @@ jobs:
           | \`$NAME-factory.bin\` | ESP32 nuevo / vacío: imagen completa a flashear en \`0x0\` |
           | \`$NAME-bootloader.bin\` / \`$NAME-partitions.bin\` | Flasheo por partes (\`0x1000\` / \`0x8000\`) |
           | \`$NAME-sha256.txt\` | Checksums |
+
+          **Actualizar un equipo que ya funciona:** abre \`http://<IP_del_proxy>/firmware\`, elige \`$NAME-firmware.bin\` y pulsa *Actualizar*. El fichero se verifica antes de instalarse y, si el firmware nuevo no arranca bien, el equipo vuelve solo a la versión anterior. También vale \`pio run -e PROD_ota -t upload\` (OTA). Las versiones anteriores a la 6.2-0 no tienen la pestaña Firmware: la primera actualización a 6.2-0 hay que hacerla por OTA o USB.
 
           Flasheo de un equipo nuevo:
 

@@ -1,4 +1,4 @@
-# 🔋 ESP32 Modbus TCP Proxy & Multiplexer for Huawei EMMA & SUN2000 (v6.1-0)
+# 🔋 ESP32 Modbus TCP Proxy & Multiplexer for Huawei EMMA & SUN2000 (v6.2-0)
 
 This repository contains industrial-grade firmware developed for **ESP32** (optimized for wired connection via the native Ethernet stack of the LAN8720 chip on WT32-ETH01 boards, or via its internal WiFi antenna). The device acts as a **network shield, transparent on-demand proxy, and Modbus TCP channel multiplexer**.
 
@@ -150,7 +150,15 @@ SERVIDORES = {
 
 ## 🚀 Version History and Changelog
 
-### 🟢 Version 6.1-0 (Current)
+### 🟢 Version 6.2-0 (Current)
+
+* **Web firmware update (issue #16):** New **Firmware** tab showing the installed version, running partition, validation state and available space. Upload the `modbusproxy-<version>-firmware.bin` from the [releases](https://github.com/shosoin/modbusproxy/releases) without PlatformIO or a USB cable.
+* **Verification before and during upload:** The browser checks that the file is an ESP32 application image (and warns if `factory.bin` was picked by mistake), that it carries the project marker `MBPXY-FW:<version>;`, and compares versions (newer / same / downgrade). Accepting a disclaimer is mandatory. The ESP32 searches for the marker again while receiving and discards any foreign firmware without touching the boot partition; `Update` validates integrity (SHA-256).
+* **Automatic rollback:** A freshly installed firmware (web or OTA) boots *pending validation* and is only confirmed after 30 s running with network. If it reboots before that, the bootloader goes back to the previous version by itself.
+* **Automatic releases:** For every new version on `main`, CI publishes a Release with `firmware.bin` (updates), `factory.bin` (new devices), bootloader, partitions and checksums.
+* **Single version source:** The version lives in `#define FW_VERSION` (read by the firmware, CI and `pre_upload.py`). `/api/status` adds `firmware_version`.
+
+### 🔵 Version 6.1-0
 
 * **Configurable Test Target (issue #12):** The boot Modbus check is no longer hard-wired to the EMMA. In `/config` and in the Setup portal, inside "Modbus TCP target", you choose the device type (`EMMA`, `SUN2000` or `Custom`), enable or disable the check and set the 4 request fields: Unit ID, function, start register and number of registers. With Custom all of them are free and the web warns that they are the user's responsibility.
 * **Persistence and migration:** Values are stored in NVS. When upgrading from 6.0-0 they are initialised with the EMMA ones (`0 / FC03 / 30000 / 15`, check enabled), so behaviour is unchanged until they are modified.
@@ -199,7 +207,7 @@ The complete behavior of the board and network stack is managed via parameteriza
   * **Persistence:** stored in NVS, surviving reboots and flashing (USB or OTA). When upgrading from an older firmware, missing values are initialised with the EMMA ones.
   * `/api/status` exposes `target_profile`, `startup_check`, `test_unit_id`, `test_function`, `test_register` and `test_reg_count`.
 * `RECONNECT_DELAY` (`const uint32_t`): Wait time in milliseconds (`5000` ms) the proxy applies before retrying a connection to Huawei's port 502 if the socket breaks, preventing bans from burst infinite retries (Anti-DDoS).
-* `FIRMWARE_VERSION` (`const String`): Stores the semantic version of the active program, rendered centered in the local menu. Also used as the suffix of the WiFi AP name in Setup Mode (`modbusproxy-<version>`).
+* `FW_VERSION` (`#define`) / `FIRMWARE_VERSION` (`const String`): Semantic version of the active program; change it only in `FW_VERSION`. Also used by CI (Release name), `pre_upload.py` and the `FW_MARKER` checked by the Firmware tab. It is, rendered centered in the local menu. Also used as the suffix of the WiFi AP name in Setup Mode (`modbusproxy-<version>`).
 
 ---
 
@@ -234,6 +242,35 @@ The device runs a web server on standard port `80` that auto-refreshes every 5 s
 
 ---
 
+## ⬆️ Web Firmware Update (Firmware tab)
+
+For devices that already run the firmware. A brand new ESP32 is flashed once over USB with `modbusproxy-<version>-factory.bin`:
+
+```bash
+esptool.py --chip esp32 write_flash 0x0 modbusproxy-<version>-factory.bin
+```
+
+**Steps:**
+
+1. Download `modbusproxy-<version>-firmware.bin` from [GitHub Releases](https://github.com/shosoin/modbusproxy/releases).
+2. Open `http://<ESP32_IP>/firmware`. It shows the installed version, the running partition (`app0`/`app1`), the state and the available space.
+3. Choose the file. Before uploading anything, the browser checks:
+   * that it is an ESP32 application image (`0xE9` header, ESP32 chip). If you pick `factory.bin`, it tells you to use `firmware.bin`;
+   * that it carries the project marker `MBPXY-FW:<version>;` (firmware from other projects is rejected);
+   * the version: *current → file*, telling whether it is newer, the same or a downgrade;
+   * that the file fits in the partition.
+4. Accept the disclaimer and press **Update**. The proxy stops serving clients, the OLED shows the progress (`UPDATE WEB`) and the device reboots when done. The page waits for it to come back and shows the new version.
+
+**Process safety:**
+
+* The ESP32 writes to the **free** OTA partition: the running version is untouched until the new one is complete and verified.
+* The ESP32 searches for the project marker again in the received stream. If missing, the upload is discarded without changing the boot partition, even if someone bypasses the browser check. `Update` also validates the image integrity (SHA-256).
+* **Rollback:** the new firmware boots *pending validation* and is confirmed after 30 s running with network (or when reaching the Setup portal). If it reboots before (crash, reset), the bootloader goes back to the previous version. This also covers ArduinoOTA updates. A firmware that hangs **without** rebooting is not rolled back: it would need USB recovery.
+* The configuration (NVS) is kept.
+* **Limits:** web/OTA updates cannot change the partition table or the bootloader; that requires USB. The tab has no password, just like `/config`: the proxy is meant for trusted local networks.
+
+---
+
 ## 📊 Remote Monitoring via REST JSON API
 
 To enable native integrations with external systems or create dedicated diagnostic sensors in Home Assistant, the firmware exposes a read-only optimized JSON endpoint at:
@@ -243,6 +280,7 @@ The response is generated by concatenating memory buffers to eliminate heavy thi
 
 ```json
 {
+  "firmware_version": "6.2-0",
   "uptime_seconds": 3245,
   "backend_state": "CONNECTED",
   "device_model": "SmartHEMS",
@@ -371,7 +409,7 @@ When NVS is empty (freshly flashed device or erased flash), `runSetup` does not 
 
 When entering Setup Mode, the ESP32:
 
-1. Creates an **open WiFi access point** named `modbusproxy-6.1-0` (no password).
+1. Creates an **open WiFi access point** named `modbusproxy-6.2-0` (no password).
 2. Assigns IP `192.168.1.1` to its own interface.
 3. Any device connecting to that WiFi and opening a browser is **automatically redirected** to the configuration page (captive portal — works just like hotel WiFi).
 4. The wizard lets you configure:
@@ -398,7 +436,7 @@ If you still have access to the proxy's web interface:
 1. Open `http://<proxy_IP>/config` in your browser.
 2. Scroll down to the **Danger Zone** section.
 3. Press **Factory Reset (Enter Setup Mode)** and confirm.
-4. The device restarts and brings up the `modbusproxy-6.1-0` AP.
+4. The device restarts and brings up the `modbusproxy-6.2-0` AP.
 
 ---
 

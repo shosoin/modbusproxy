@@ -8,6 +8,8 @@
 #include <WebServer.h>
 #include <ArduinoOTA.h>
 #include <Preferences.h>
+#include <Update.h>
+#include <esp_ota_ops.h>
 #include "secrets.h"   // Valores default del primer arranque — EXCLUIDO DE GIT
 #include <esp_wifi.h>
 #include <esp_log.h>
@@ -236,7 +238,16 @@ const int BOTON_MENOS = 39;
 // Ver bloque "DISPOSITIVO DESTINO Y TEST DE CONEXIÓN DE ARRANQUE".
 const uint32_t RECONNECT_DELAY = 100;   // ms mínimos entre reconexiones al backend
 
-const String FIRMWARE_VERSION = "6.1-0";
+// Versión del firmware: cambiar SOLO aquí. La leen también el CI (nombre de
+// la Release) y pre_upload.py.
+#define FW_VERSION "6.2-0"
+const String FIRMWARE_VERSION = FW_VERSION;
+
+// Marca del proyecto incrustada en el binario. La pestaña Firmware la busca
+// en el .bin que se sube (navegador y ESP32) para comprobar que es un
+// firmware de este proyecto y leer su versión. Formato: MBPXY-FW:<versión>;
+// Se imprime por Serial al arrancar para que el linker no la elimine.
+const char FW_MARKER[] = "MBPXY-FW:" FW_VERSION ";";
 // ====================================================================
 
 // Máquina de estados extendida
@@ -370,6 +381,9 @@ void handleWebConfigSave();
 void handleFactoryReset();
 void handleReboot();
 void handleWifiScan();
+void handleWebFirmware();
+void handleFirmwareUpload();
+void handleFirmwareUploadDone();
 String buildNavBar(const String &activePage);
 
 // ====================================================================
@@ -503,27 +517,16 @@ void readTargetConfigArgs(WebServer& srv) {
 // Requiere que display ya este declarado (Adafruit_SH1106G) y FIRMWARE_VERSION definido
 #include "setup_mode.hpp"
 
+// Pestaña Firmware: actualización desde la web + validación/rollback
+#include "web_update.hpp"
+
 void setupOTA() {
     ArduinoOTA.setPort(3232);
     ArduinoOTA.setHostname("Proxy-Huawei");
     ArduinoOTA.setPassword(cfg.otaPassword);
 
     ArduinoOTA.onStart([]() {
-        otaInProgress = true; 
-        if (backendClient.connected()) backendClient.stop();
-        if (proxyServer.hasClient()) proxyServer.available().stop();
-        for (int i = 0; i < MAX_CLIENTS; i++) {
-            if (clients[i] && clients[i].connected()) clients[i].stop();
-        }
-
-        display.clearDisplay();
-        display.setTextSize(1);
-        display.setTextColor(SH110X_WHITE);
-        display.setCursor(0, 10);
-        display.println("MODO OTA ACTIVADO");
-        display.setCursor(0, 25);
-        display.println("Recibiendo firmware...");
-        display.display();
+        beginFirmwareUpdate("MODO OTA ACTIVADO");
     });
 
     ArduinoOTA.onEnd([]() {
@@ -536,22 +539,7 @@ void setupOTA() {
     });
 
     ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
-        int percent = (progress / (total / 100));
-        
-        display.clearDisplay();
-        display.setTextSize(1);
-        display.setCursor(0, 0);
-        display.println("UPDATING (OTA)");
-        
-        display.setCursor(0, 20);
-        display.print("Progreso: ");
-        display.print(percent);
-        display.println("%");
-
-        display.drawRect(0, 35, 128, 12, SH110X_WHITE);
-        display.fillRect(0, 35, (128 * percent) / 100, 12, SH110X_WHITE);
-        
-        display.display();
+        drawUpdateProgress("UPDATING (OTA)", progress / (total / 100));
     });
 
     ArduinoOTA.onError([](ota_error_t error) {
@@ -576,6 +564,7 @@ void setupOTA() {
 void setup() {
     Serial.begin(115200);
     esp_log_level_set("*", ESP_LOG_NONE);
+    initFirmwareValidation();   // ¿firmware recién actualizado pendiente de validar?
 
     // Comprobar si debemos entrar en modo Setup.
     // "runSetup"=true  → entrar en Setup  (default true = dispositivo virgen)
@@ -586,6 +575,7 @@ void setup() {
         bool goSetup = _p.getBool("runSetup", SETUP_NEEDED); // default: virgen → Setup
         _p.end();
         if (goSetup) {
+            markFirmwareValid(); // llegar al portal de Setup basta para dar el firmware por bueno
             loadConfig(); // poblar cfg con NVS/defaults antes de mostrar el setup
             Wire.begin(33, 32);
             if (!display.begin(DIRECCION_I2C, true)) {}
@@ -644,6 +634,8 @@ void setup() {
     webServer.on("/factory-reset",  HTTP_POST, handleFactoryReset);
     webServer.on("/reboot",         HTTP_POST, handleReboot);
     webServer.on("/wifi-scan",      HTTP_GET,  handleWifiScan);
+    webServer.on("/firmware",        HTTP_GET,  handleWebFirmware);
+    webServer.on("/firmware/upload", HTTP_POST, handleFirmwareUploadDone, handleFirmwareUpload);
     webServer.begin();
 
     backendMutex = xSemaphoreCreateMutex();
@@ -655,6 +647,7 @@ void setup() {
     Serial.println();
     Serial.println("============================================");
     Serial.println("  PROXY MODBUS TCP v" + FIRMWARE_VERSION);
+    Serial.println(String("  Marca    : ") + FW_MARKER);
     Serial.println("============================================");
 
     if (cfg.useEthernet) {
@@ -703,6 +696,10 @@ void loop() {
         return; 
     }
 
+    bool networkUp = cfg.useEthernet ? (ETH.localIP() != IPAddress(0,0,0,0))
+                                     : (WiFi.status() == WL_CONNECTED);
+    checkFirmwareValidation(networkUp);
+
     checkButtons(); 
     handleNavigation(); 
     renderUI(); 
@@ -741,6 +738,7 @@ String buildNavBar(const String &activePage) {
     nav += navLink("/",       L->nav_dashboard, "dashboard");
     nav += navLink("/log",    L->nav_log,       "log");
     nav += navLink("/config", L->nav_config,    "config");
+    nav += navLink("/firmware", L->nav_firmware, "firmware");
     nav += "<span style='margin-left:auto;color:#4da6ff;font-size:12px;opacity:0.7;'>v" + FIRMWARE_VERSION + "</span>";
     nav += "</nav>";
     return nav;
@@ -1349,6 +1347,7 @@ void handleApiStatus() {
     uint32_t currentUptime = millis() / 1000;
 
     String json = "{";
+    json += "\"firmware_version\":\"" + FIRMWARE_VERSION + "\",";
     json += "\"uptime_seconds\":" + String(currentUptime) + ",";
     json += "\"backend_state\":\"" + stateStr + "\",";
     json += "\"device_model\":\"" + emmaDeviceModel + "\",";
