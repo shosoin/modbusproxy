@@ -18,3 +18,4 @@ Thumbs.db
 *.bin
 __pycache__/
 *.pyc
+dist/
