@@ -20,6 +20,78 @@
 // ====================================================================
 Preferences prefs;
 
+// ====================================================================
+// DISPOSITIVO DESTINO Y TEST DE CONEXIÓN DE ARRANQUE  (issue #12)
+//
+// Al arrancar, el proxy NO acepta clientes externos (Home Assistant...)
+// hasta superar dos "peajes", ambos contra la IP de "Destino Modbus TCP"
+// (cfg.modbusIP / cfg.modbusPort):
+//   1. Ping ICMP a cfg.modbusIP (reintento cada 30 s hasta que responde;
+//      una vez superado no se repite). Siempre activo. También se puede
+//      lanzar a mano desde el menú OLED ("Test Ping").
+//   2. Test Modbus (opcional, cfg.startupCheck), reintento cada 10 s.
+//      Petición definida por 4 datos, todos persistentes en NVS:
+//        - cfg.testUnitId    Unit ID al que se pregunta
+//        - cfg.testFunc      Código de función (1..127). Default 0x03.
+//        - cfg.testRegister  Registro inicial (campo "dirección" de la PDU)
+//        - cfg.testRegCount  Número de registros (campo "cantidad", 16 bits)
+//      Trama: [MBAP][Unit ID][FC][registro 2B][cantidad 2B]. Es el formato
+//      de las lecturas FC01..FC04. En Custom se admite cualquier FC: con
+//      FC05/06 esos 4 bytes serían dirección + VALOR A ESCRIBIR, y el
+//      equipo se modificaría en cada intento. Es responsabilidad de quien
+//      lo configura.
+//      Se da por superado con cualquier respuesta Modbus válida:
+//        a) respuesta normal (misma FC): con FC03/FC04 el texto ASCII leído
+//           (cortado en el primer espacio) se muestra como modelo en OLED y
+//           web; con otras FC se muestra "FCnn-OK"; o
+//        b) excepción Modbus (FC | 0x80): el destino tiene el stack Modbus
+//           vivo aunque rechace la petición.
+//   Con startupCheck = false el peaje 2 se salta y la pasarela se abre
+//   en cuanto responde el ping.
+//
+// IMPORTANTE: el Unit ID configurado solo afecta al test de arranque y a
+// los diagnósticos del menú. Las peticiones de los clientes se reenvían
+// tal cual, con su propio Unit ID, así que un cliente puede hablar con
+// varios equipos (EMMA, inversores...) a través del proxy.
+//
+// Perfiles (TARGET_PROFILES): presets de los 4 datos. Al elegir EMMA o
+// SUN2000 se cargan sus valores; el Unit ID sigue siendo editable y los
+// otros 3 quedan fijos. CUSTOM permite editar los 4 libremente.
+// En la web: subsección "Test Target" dentro de "Destino Modbus TCP".
+//
+// Persistencia: si las claves no existen en NVS (primer arranque o
+// actualización desde un firmware anterior) se inicializan con los
+// valores de la EMMA, que es lo que hacía el firmware hasta ahora.
+// La NVS sobrevive a reinicios y a flasheos (USB u OTA); solo se pierde
+// con un borrado completo de flash (pio run -t erase).
+// ====================================================================
+enum TargetProfileId : uint8_t {
+    TARGET_EMMA    = 0,
+    TARGET_SUN2000 = 1,
+    TARGET_CUSTOM  = 2,
+};
+
+struct TargetProfile {
+    const char* name;
+    uint8_t     unitId;     // Unit ID sugerido (editable)
+    uint8_t     func;       // Código de función (0x03 holding / 0x04 input...)
+    uint16_t    reg;        // Registro inicial
+    uint16_t    count;      // Número de registros
+};
+
+// Indexado por TargetProfileId. Para añadir un perfil: nueva entrada aquí
+// (antes de Custom) y nuevo valor en el enum.
+// Huawei exige leer las cadenas completas: el Model name de 30000 son
+// 15 registros (30 bytes). Pedir menos devuelve excepción 0x03.
+const TargetProfile TARGET_PROFILES[] = {
+    //  nombre      ID   func   registro  nº regs
+    { "EMMA",       0,   0x03,  30000,    15 },  // EMMA: Unit ID 0, reg 30000 = Model name (ASCII)
+    { "SUN2000",    1,   0x03,  30000,    15 },  // Inversor SUN2000 (directo / SDongle): Unit ID 1 habitual
+    { "Custom",     0,   0x03,  30000,    15 },  // Solo valores iniciales del formulario
+};
+const uint8_t TARGET_PROFILE_COUNT = sizeof(TARGET_PROFILES) / sizeof(TARGET_PROFILES[0]);
+
+
 struct AppConfig {
     bool   useEthernet      = false;
     bool   useDHCP          = false;
@@ -34,9 +106,64 @@ struct AppConfig {
     char   dns[16]          = DEFAULT_DNS;         // <- secrets.h
     char   otaPassword[32]  = DEFAULT_OTA_PASSWORD;    // <- secrets.h
     char   lang[3]          = "es";
+
+    // --- Dispositivo destino / test de arranque (ver bloque de arriba) ---
+    // Defaults = EMMA (comportamiento del firmware anterior)
+    uint8_t  targetProfile  = TARGET_EMMA;   // TargetProfileId
+    bool     startupCheck   = true;          // false = saltar el peaje 2
+    uint8_t  testUnitId     = 0;             // Unit ID
+    uint8_t  testFunc       = 0x03;          // Código de función (1..127)
+    uint16_t testRegister   = 30000;         // Registro inicial
+    uint16_t testRegCount   = 15;            // Número de registros
 };
 
 AppConfig cfg;
+
+// Trama Modbus TCP del test con la función, registro y nº de registros de cfg
+void buildTestRequest(uint8_t unitId, uint8_t frame[12]) {
+    const uint8_t f[12] = { 0x00, 0x01, 0x00, 0x00, 0x00, 0x06, unitId, cfg.testFunc,
+                            (uint8_t)(cfg.testRegister >> 8), (uint8_t)(cfg.testRegister & 0xFF),
+                            (uint8_t)(cfg.testRegCount >> 8), (uint8_t)(cfg.testRegCount & 0xFF) };
+    memcpy(frame, f, 12);
+}
+
+// Clasificación de la respuesta: normal = misma FC; excepción = FC | 0x80
+bool isTestReply(uint8_t fc)     { return fc == cfg.testFunc; }
+bool isTestException(uint8_t fc) { return fc == (uint8_t)(cfg.testFunc | 0x80); }
+
+// Texto ASCII de una respuesta FC03/FC04 (no imprimibles -> espacio).
+// "" si la FC no devuelve registros o el byte count no cabe en la PDU.
+String testReplyText(const uint8_t* pdu, uint16_t pduLen) {
+    if ((cfg.testFunc != 0x03 && cfg.testFunc != 0x04) || pduLen < 2) return "";
+    uint8_t n = pdu[1];
+    if (n == 0 || n > pduLen - 2) return "";
+    String out;
+    out.reserve(n);
+    for (uint8_t i = 0; i < n; i++) {
+        char c = (char)pdu[2 + i];
+        out += (c >= 32 && c <= 126) ? c : ' ';
+    }
+    return out;
+}
+
+// Modelo a mostrar tras una respuesta normal del test
+String testReplyLabel(const uint8_t* pdu, uint16_t pduLen) {
+    String txt = testReplyText(pdu, pduLen);
+    txt.trim();
+    if (txt.length() > 0) return txt;
+    if (cfg.testFunc == 0x03 || cfg.testFunc == 0x04) return "UNKNOWN";
+    return "FC" + String(cfg.testFunc) + "-OK";
+}
+
+// Persistencia de los campos de destino (compartida por /config y Setup)
+void saveTargetConfig(Preferences& p) {
+    p.putUChar ("tgtProf", cfg.targetProfile);
+    p.putBool  ("tstOn",   cfg.startupCheck);
+    p.putUChar ("tstId",   cfg.testUnitId);
+    p.putUChar ("tstFc",   cfg.testFunc);
+    p.putUShort("tstReg",  cfg.testRegister);
+    p.putUShort("tstCnt",  cfg.testRegCount);
+}
 
 // Cambia a true para que el proximo arranque entre en modo Setup.
 // Solo afecta a dispositivos sin NVS configurada (virgen o borrada).
@@ -58,6 +185,16 @@ void loadConfig() {
     prefs.getString("dns",       cfg.dns,         sizeof(cfg.dns));
     prefs.getString("otaPass",   cfg.otaPassword, sizeof(cfg.otaPassword));
     prefs.getString("lang",      cfg.lang,        sizeof(cfg.lang));
+    // Test de arranque: si la clave no existe (firmware anterior) -> valores EMMA
+    const TargetProfile& emma = TARGET_PROFILES[TARGET_EMMA];
+    cfg.targetProfile = prefs.getUChar ("tgtProf", TARGET_EMMA);
+    cfg.startupCheck  = prefs.getBool  ("tstOn",   true);
+    cfg.testUnitId    = prefs.getUChar ("tstId",   emma.unitId);
+    cfg.testFunc      = prefs.getUChar ("tstFc",   emma.func);
+    cfg.testRegister  = prefs.getUShort("tstReg",  emma.reg);
+    cfg.testRegCount  = prefs.getUShort("tstCnt",  emma.count);
+    if (cfg.targetProfile >= TARGET_PROFILE_COUNT) cfg.targetProfile = TARGET_EMMA;
+    if (cfg.testFunc < 1 || cfg.testFunc > 127) cfg.testFunc = emma.func;
     prefs.end();
     i18nInit(cfg.lang);
 }
@@ -77,6 +214,7 @@ void saveConfig() {
     prefs.putString("dns",        cfg.dns);
     prefs.putString("otaPass",    cfg.otaPassword);
     prefs.putString("lang",       cfg.lang);
+    saveTargetConfig(prefs);
     prefs.putBool("runSetup", false);
     prefs.end();
 }
@@ -93,11 +231,12 @@ const int BOTON_BACK  = 14;
 const int BOTON_MAS   = 15;
 const int BOTON_MENOS = 39;
 
-const uint8_t  MODBUS_FIXED_ID = 0;
-const uint16_t MODBUS_TEST_REG = 30000;
-const uint32_t RECONNECT_DELAY = 100;
+// MODBUS_FIXED_ID / MODBUS_TEST_REG ya no son constantes: ahora son
+// configurables desde la web (cfg.testUnitId, cfg.testRegister...).
+// Ver bloque "DISPOSITIVO DESTINO Y TEST DE CONEXIÓN DE ARRANQUE".
+const uint32_t RECONNECT_DELAY = 100;   // ms mínimos entre reconexiones al backend
 
-const String FIRMWARE_VERSION = "6.0-0";
+const String FIRMWARE_VERSION = "6.1-0";
 // ====================================================================
 
 // Máquina de estados extendida
@@ -233,6 +372,133 @@ void handleReboot();
 void handleWifiScan();
 String buildNavBar(const String &activePage);
 
+// ====================================================================
+// SUBSECCIÓN "TEST TARGET" — compartida por /config y Setup.
+// Se inserta dentro de "Destino Modbus TCP", justo tras IP y puerto.
+// lblClass: clase CSS de los <label> de cada página ("" o "lbl").
+// ====================================================================
+void appendTargetConfigForm(String& html, const char* lblClass) {
+    String lbl = String("<label class='") + lblClass + "'";
+
+    html += F("<div style='border:1px solid #333;border-radius:6px;padding:12px 14px 2px;margin-bottom:18px;'>");
+    html += F("<h4 style='color:#a0c4ff;margin:0 0 6px;'>");
+    html += L->tgt_h3;
+    html += "</h4><p class='section-note'>";
+    html += L->tgt_note;
+    html += "</p>";
+
+    // Perfil
+    html += "<div class='form-group'>" + lbl + " for='tgtProf'>";
+    html += L->tgt_profile;
+    html += "</label><select id='tgtProf' name='tgtProf' onchange='tgtChg(true)'>";
+    for (uint8_t i = 0; i < TARGET_PROFILE_COUNT; i++) {
+        html += "<option value='" + String(i) + "'";
+        if (cfg.targetProfile == i) html += " selected";
+        html += ">";
+        html += (i == TARGET_CUSTOM) ? L->tgt_custom : TARGET_PROFILES[i].name;
+        html += "</option>";
+    }
+    html += "</select></div>";
+
+    // Aviso de responsabilidad: solo visible con perfil Custom
+    html += "<div class='warn' id='tstWarn'>";
+    html += L->tgt_custom_warn;
+    html += "</div>";
+
+    // Habilitar / deshabilitar test
+    html += "<div class='form-group'>" + lbl + ">";
+    html += L->tgt_check;
+    html += "</label><div class='radio-group'>";
+    html += "<label><input type='radio' name='tstOn' value='1' onchange='tgtChg(false)'";
+    html += (cfg.startupCheck ? " checked" : "");
+    html += "> ";
+    html += L->tgt_check_on;
+    html += "</label><label><input type='radio' name='tstOn' value='0' onchange='tgtChg(false)'";
+    html += (!cfg.startupCheck ? " checked" : "");
+    html += "> ";
+    html += L->tgt_check_off;
+    html += "</label></div></div>";
+
+    // Los 4 datos de la petición (se atenúan si el test está desactivado).
+    // EMMA/SUN2000: Unit ID editable, el resto fijo por el perfil. Custom: todo editable.
+    html += "<div id='tstFields'>";
+
+    html += "<div class='form-group'>" + lbl + " for='tstId'>";
+    html += L->tgt_unit_id;
+    html += "</label><input type='number' id='tstId' name='tstId' min='0' max='255' value='";
+    html += String(cfg.testUnitId);
+    html += "'><p class='section-note'>";
+    html += L->tgt_unit_note;
+    html += "</p></div>";
+
+    html += "<div class='form-group'>" + lbl + " for='tstFc'>";
+    html += L->tgt_func;
+    html += "</label><input type='number' id='tstFc' name='tstFc' min='1' max='127' value='";
+    html += String(cfg.testFunc);
+    html += "'><p class='section-note'>";
+    html += L->tgt_func_note;
+    html += "</p></div>";
+
+    html += "<div class='form-group'>" + lbl + " for='tstReg'>";
+    html += L->tgt_register;
+    html += "</label><input type='number' id='tstReg' name='tstReg' min='0' max='65535' value='";
+    html += String(cfg.testRegister);
+    html += "'></div>";
+
+    html += "<div class='form-group'>" + lbl + " for='tstCnt'>";
+    html += L->tgt_reg_count;
+    html += "</label><input type='number' id='tstCnt' name='tstCnt' min='0' max='65535' value='";
+    html += String(cfg.testRegCount);
+    html += "'></div>";
+
+    html += "</div></div>";  // fin tstFields + caja Test Target
+
+    // JS: al cambiar de perfil carga sus valores; bloquea func/reg/nº salvo en Custom.
+    // TGT = [[unitId, func, reg, count], ...] indexado por TargetProfileId
+    html += "<script>var TGT=[";
+    for (uint8_t i = 0; i < TARGET_PROFILE_COUNT; i++) {
+        const TargetProfile& t = TARGET_PROFILES[i];
+        if (i) html += ",";
+        html += "[" + String(t.unitId) + "," + String(t.func) + "," + String(t.reg) + "," + String(t.count) + "]";
+    }
+    html += "];function tgtChg(u){var g=function(i){return document.getElementById(i);};";
+    html += "var p=+g('tgtProf').value,c=(p==" + String(TARGET_CUSTOM) + ");";
+    html += "if(u&&!c){g('tstId').value=TGT[p][0];g('tstFc').value=TGT[p][1];g('tstReg').value=TGT[p][2];g('tstCnt').value=TGT[p][3];}";
+    html += "g('tstWarn').style.display=c?'':'none';g('tstFc').readOnly=!c;g('tstReg').readOnly=!c;g('tstCnt').readOnly=!c;";
+    html += "var on=document.querySelector('input[name=tstOn][value=\"1\"]').checked;";
+    html += "g('tstFields').style.opacity=on?'':'.45';}";
+    html += "tgtChg(false);</script>";
+}
+
+// Vuelca los campos POST del formulario de destino en cfg.
+// Con perfil EMMA/SUN2000 se fuerzan func/reg/nº del perfil (el Unit ID se respeta).
+void readTargetConfigArgs(WebServer& srv) {
+    int prof = srv.arg("tgtProf").toInt();
+    if (srv.hasArg("tgtProf") && prof >= 0 && prof < TARGET_PROFILE_COUNT) cfg.targetProfile = (uint8_t)prof;
+
+    if (srv.hasArg("tstOn")) cfg.startupCheck = (srv.arg("tstOn") == "1");
+
+    String val = srv.arg("tstId"); val.trim();
+    if (val.length() > 0 && val.toInt() >= 0 && val.toInt() <= 255) cfg.testUnitId = (uint8_t)val.toInt();
+
+    if (cfg.targetProfile != TARGET_CUSTOM) {
+        const TargetProfile& t = TARGET_PROFILES[cfg.targetProfile];
+        cfg.testFunc     = t.func;
+        cfg.testRegister = t.reg;
+        cfg.testRegCount = t.count;
+        return;
+    }
+
+    val = srv.arg("tstFc"); val.trim();
+    if (val.length() > 0 && val.toInt() >= 1 && val.toInt() <= 127) cfg.testFunc = (uint8_t)val.toInt();
+
+    val = srv.arg("tstReg"); val.trim();
+    if (val.length() > 0 && val.toInt() >= 0 && val.toInt() <= 65535) cfg.testRegister = (uint16_t)val.toInt();
+
+    val = srv.arg("tstCnt"); val.trim();
+    if (val.length() > 0 && val.toInt() >= 0 && val.toInt() <= 65535) cfg.testRegCount = (uint16_t)val.toInt();
+}
+
 // Modo setup: AP WiFi + portal cautivo para configuracion inicial
 // Requiere que display ya este declarado (Adafruit_SH1106G) y FIRMWARE_VERSION definido
 #include "setup_mode.hpp"
@@ -337,6 +603,11 @@ void setup() {
     subnet_IP.fromString(cfg.subnet);
     dns_IP.fromString(cfg.dns);
     targetModbusIP.fromString(cfg.modbusIP);
+
+    // Peaje 2 (test Modbus de arranque) deshabilitable desde /config
+    checkEmmaStartup = cfg.startupCheck;
+    if (!checkEmmaStartup) emmaDeviceModel = "N/A (test off)";
+
     pinMode(BOTON_OK, INPUT_PULLUP); pinMode(BOTON_BACK, INPUT_PULLUP);
     pinMode(BOTON_MAS, INPUT_PULLUP); pinMode(BOTON_MENOS, INPUT); 
 
@@ -710,6 +981,9 @@ void handleWebConfig() {
     html += String(cfg.modbusPort);
     html += "'></div>";
 
+    // ---- SECCIÓN: DISPOSITIVO DESTINO / TEST DE ARRANQUE ----
+    appendTargetConfigForm(html, "");
+
     // ---- SECCIÓN: RED ESTÁTICA ----
     html += "<h3>";
     html += L->cfg_h3_static;
@@ -864,6 +1138,8 @@ void handleWebConfigSave() {
 
     int port = webServer.arg("modbusPort").toInt();
     if (port > 0 && port <= 65535) cfg.modbusPort = (uint16_t)port;
+
+    readTargetConfigArgs(webServer);
 
     val = webServer.arg("localIP"); val.trim();
     if (val.length() > 0) strncpy(cfg.localIP, val.c_str(), sizeof(cfg.localIP) - 1);
@@ -1076,6 +1352,12 @@ void handleApiStatus() {
     json += "\"uptime_seconds\":" + String(currentUptime) + ",";
     json += "\"backend_state\":\"" + stateStr + "\",";
     json += "\"device_model\":\"" + emmaDeviceModel + "\",";
+    json += "\"target_profile\":\"" + String(TARGET_PROFILES[cfg.targetProfile].name) + "\",";
+    json += "\"startup_check\":" + String(cfg.startupCheck ? "true" : "false") + ",";
+    json += "\"test_unit_id\":" + String(cfg.testUnitId) + ",";
+    json += "\"test_function\":" + String(cfg.testFunc) + ",";
+    json += "\"test_register\":" + String(cfg.testRegister) + ",";
+    json += "\"test_reg_count\":" + String(cfg.testRegCount) + ",";
     json += "\"active_clients\":" + String(activeSockets) + ",";
     json += "\"max_clients\":" + String(MAX_CLIENTS) + ",";
     json += "\"debug_attempts\":" + String(emmaDebugAttempts) + ",";
@@ -1396,7 +1678,7 @@ void taskModbusProxy(void *parameter) {
                 lastEmmaCheckTime = millis();
                 
                 emmaDebugAttempts++;
-                emmaDebugStage = "Abriendo Socket TCP hacia " + targetModbusIP.toString() + ":502...";
+                emmaDebugStage = "Abriendo Socket TCP hacia " + targetModbusIP.toString() + ":" + String(cfg.modbusPort) + "...";
                 emmaDebugHexSent = "-";
                 emmaDebugHexReceived = "-";
                 emmaDebugError = "En curso...";
@@ -1407,8 +1689,12 @@ void taskModbusProxy(void *parameter) {
                     if (backendClient.connect(targetModbusIP, cfg.modbusPort)) {
                         emmaDebugStage = "Conectado TCP con éxito. Inyectando Query Modbus...";
                         
-                        uint8_t reqFrame[] = { 0x00, 0x01, 0x00, 0x00, 0x00, 0x06, MODBUS_FIXED_ID, 0x03, 0x75, 0x30, 0x00, 0x0F };
-                        emmaDebugHexSent = "00 01 00 00 00 06 00 03 75 30 00 0F";
+                        // Unit ID y registro configurables (perfil de destino, ver cabecera)
+                        uint8_t reqFrame[12];
+                        buildTestRequest(cfg.testUnitId, reqFrame);
+                        char reqHex[40];
+                        bytesToHexStr(reqFrame, 12, reqHex, sizeof(reqHex));
+                        emmaDebugHexSent = reqHex;
                         backendClient.write(reqFrame, 12);
                         
                         emmaDebugStage = "Trama enviada. Esperando cabecera MBAP (7 bytes) de la EMMA...";
@@ -1422,7 +1708,7 @@ void taskModbusProxy(void *parameter) {
                             emmaDebugHexReceived.toUpperCase();
 
                             uint16_t rLen = (resMbap[4] << 8) | resMbap[5];
-                            if (rLen >= 3 && rLen < 100) {
+                            if (rLen >= 3 && rLen < 260) {
                                 uint16_t pduLen = rLen - 1;
                                 uint8_t* resPdu = new uint8_t[pduLen];
                                 
@@ -1434,41 +1720,23 @@ void taskModbusProxy(void *parameter) {
                                     }
                                     emmaDebugHexReceived.toUpperCase();
 
-                                    if (resPdu[0] == 0x03 || resPdu[0] == 0x04) {
-                                        uint8_t byteCount = resPdu[1];
-                                        if (byteCount > 0 && byteCount <= pduLen - 2) {
-                                            char* modelStr = new char[byteCount + 1];
-                                            for (int m = 0; m < byteCount; m++) {
-                                                char c = (char)resPdu[2 + m];
-                                                if (c >= 32 && c <= 126) modelStr[m] = c; 
-                                                else modelStr[m] = ' ';
-                                            }
-                                            modelStr[byteCount] = '\0';
-                                            
-                                            String cleanStr = String(modelStr);
+                                    if (isTestReply(resPdu[0])) {
+                                        String cleanStr = testReplyLabel(resPdu, pduLen);
 
-                                            // --- CIRUGÍA ESTÉTICA: Cortar en el primer espacio ---
-                                            int posEspacio = cleanStr.indexOf(' '); 
-                                            if (posEspacio > 0) {
-                                                cleanStr = cleanStr.substring(0, posEspacio); // Corta el texto
-                                            }
-                                            // -----------------------------------------------------
-
-                                            cleanStr.trim(); 
-
-                                            if (cleanStr.length() > 0) {
-                                                emmaDeviceModel = cleanStr;  
-                                            } else {
-                                                emmaDeviceModel = "UNKNOWN";
-                                            }
-                                            delete[] modelStr;
+                                        // --- CIRUGÍA ESTÉTICA: Cortar en el primer espacio ---
+                                        int posEspacio = cleanStr.indexOf(' '); 
+                                        if (posEspacio > 0) {
+                                            cleanStr = cleanStr.substring(0, posEspacio); // Corta el texto
                                         }
+                                        // -----------------------------------------------------
+
+                                        emmaDeviceModel = cleanStr;
                                         checkEmmaStartup = false;    
                                         currentBackendState = BK_WAITING; 
                                         emmaDebugError = "Ninguno (¡Éxito absoluto!)";
                                         emmaDebugStage = "Completado. Pasarela liberada para Home Assistant.";
                                         
-                                    } else if (resPdu[0] == 0x83 || resPdu[0] == 0x84) {
+                                    } else if (isTestException(resPdu[0])) {
                                         emmaDeviceModel = "SmartHEMS (Forzado por Excepcion)";
                                         checkEmmaStartup = false; 
                                         currentBackendState = BK_WAITING;
@@ -1705,7 +1973,7 @@ void handleNavigation() {
             if (okPressed) {
                 if (currentMenuOption == 0) { currentMenuState = MENU_CLIENTS_LIST; selectedClientIdx = 0; } 
                 else if (currentMenuOption == 1) { currentMenuState = MENU_TEST_PING; diagnosticResult = "OK:Iniciar Test"; } 
-                else if (currentMenuOption == 2) { currentMenuState = MENU_TEST_FIXED; diagnosticResult = "OK p/ ID " + String(MODBUS_FIXED_ID); } 
+                else if (currentMenuOption == 2) { currentMenuState = MENU_TEST_FIXED; diagnosticResult = "OK p/ ID " + String(cfg.testUnitId); } 
                 else if (currentMenuOption == 3) { currentMenuState = MENU_TEST_SCAN; diagnosticResult = "OK:Iniciar Scan"; }
                 else if (currentMenuOption == 4) { isPaused = !isPaused; } 
                 else if (currentMenuOption == 5) { currentMenuState = MENU_SHUTDOWN; diagnosticResult = "OK:Confirmar"; }
@@ -1791,7 +2059,7 @@ void renderUI() {
             }
             
             display.setCursor(0, 24); display.print("Server: "); display.println(serverStatus);
-            display.setCursor(0, 35); display.print("EMMA: "); 
+            display.setCursor(0, 35); display.print("Disp: "); 
             
             bool ocultarModelOled = (currentBackendState == BK_PAUSED || currentBackendState == BK_PING_ERR || currentBackendState == BK_STARTUP_PING);
             if (ocultarModelOled) {
@@ -1929,34 +2197,25 @@ void ejecutarTestPing() {
 }
 
 void ejecutarTestModbusFijo() {
-    diagnosticResult = "Lanzando ID " + String(MODBUS_FIXED_ID) + "..."; renderUI();
+    diagnosticResult = "Lanzando ID " + String(cfg.testUnitId) + "..."; renderUI();
     if (xSemaphoreTake(backendMutex, pdMS_TO_TICKS(3000)) == pdTRUE) {
         if (backendClient.connected()) backendClient.stop();
         if (backendClient.connect(targetModbusIP, cfg.modbusPort)) {
-            uint8_t reqFrame[] = { 0x00, 0x01, 0x00, 0x00, 0x00, 0x06, MODBUS_FIXED_ID, 0x03, 0x75, 0x30, 0x00, 0x0F };
+            uint8_t reqFrame[12];
+            buildTestRequest(cfg.testUnitId, reqFrame);
             backendClient.write(reqFrame, 12);
             uint8_t resMbap[7];
             if (readExact(backendClient, resMbap, 7, 500)) {
                 uint16_t rLen = (resMbap[4] << 8) | resMbap[5];
-                if (rLen >= 3 && rLen < 100) {
+                if (rLen >= 3 && rLen < 260) {
                     uint16_t pduLen = rLen - 1; 
                     uint8_t* resPdu = new uint8_t[pduLen];
                     if (readExact(backendClient, resPdu, pduLen, 1500)) {
-                        if (resPdu[0] == 0x03 || resPdu[0] == 0x04) { 
-                            uint8_t bCount = resPdu[1];
-                            char* tStr = new char[bCount + 1];
-                            for (int m = 0; m < bCount; m++) {
-                                char c = (char)resPdu[2 + m];
-                                if (c >= 32 && c <= 126) tStr[m] = c;
-                                else tStr[m] = ' ';
-                            }
-                            tStr[bCount] = '\0';
-                            diagnosticResult = "OK! Leido:\n" + String(tStr);
-                            emmaDeviceModel = String(tStr);
-                            emmaDeviceModel.trim();
+                        if (isTestReply(resPdu[0])) { 
+                            emmaDeviceModel = testReplyLabel(resPdu, pduLen);
+                            diagnosticResult = "OK! Leido:\n" + emmaDeviceModel;
                             checkEmmaStartup = false;
-                            delete[] tStr;
-                        } else if (resPdu[0] == 0x83 || resPdu[0] == 0x84) {
+                        } else if (isTestException(resPdu[0])) {
                             diagnosticResult = "Modbus Ok!\nRespuesta Excepcion Viva";
                             emmaDeviceModel = "SmartHEMS";
                             checkEmmaStartup = false;
@@ -1984,7 +2243,7 @@ void ejecutarEscanerModbus() {
     renderUI();
 
     if (xSemaphoreTake(backendMutex, pdMS_TO_TICKS(15000)) == pdTRUE) {
-        for (int i = 0; i < 7; i++) {
+        for (size_t i = 0; i < sizeof(idsAProbar); i++) {
             uint8_t idActual = idsAProbar[i];
             diagnosticResult = "Probando ID: " + String(idActual) + "..."; 
             renderUI();
@@ -1992,31 +2251,22 @@ void ejecutarEscanerModbus() {
             if (backendClient.connected()) backendClient.stop();
             
             if (backendClient.connect(targetModbusIP, cfg.modbusPort)) {
-                uint8_t reqFrame[] = { 0x00, 0x01, 0x00, 0x00, 0x00, 0x06, idActual, 0x03, 0x75, 0x30, 0x00, 0x0F };
+                uint8_t reqFrame[12];
+                buildTestRequest(idActual, reqFrame);
                 backendClient.write(reqFrame, 12);
                 
                 uint8_t resMbap[7];
                 if (readExact(backendClient, resMbap, 7, 500)) {
                     uint16_t rLen = (resMbap[4] << 8) | resMbap[5];
-                    if (rLen >= 3 && rLen < 50) {
+                    if (rLen >= 3 && rLen < 260) {
                         uint16_t pduLen = rLen - 1; 
                         uint8_t* resPdu = new uint8_t[pduLen];
                         
                         if (readExact(backendClient, resPdu, pduLen, 500)) {
-                            if (resPdu[0] == 0x03 || resPdu[0] == 0x04) { 
-                                uint8_t bCount = resPdu[1];
-                                char* tempStr = new char[bCount + 1];
-                                for(int m=0; m<bCount; m++) {
-                                    char c = (char)resPdu[2+m];
-                                    if(c >= 32 && c <= 126) tempStr[m] = c;
-                                    else tempStr[m] = ' ';
-                                }
-                                tempStr[bCount] = '\0';
-                                textoDetectado = String(tempStr);
-                                textoDetectado.trim();
+                            if (isTestReply(resPdu[0])) { 
+                                textoDetectado = testReplyLabel(resPdu, pduLen);
                                 idExitoso = idActual;
                                 idEncontrado = true;
-                                delete[] tempStr;
                             }
                         }
                         delete[] resPdu;

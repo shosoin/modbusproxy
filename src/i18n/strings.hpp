@@ -167,4 +167,20 @@ struct LangStrings {
     const char* log_col_exc;
     const char* log_col_req_hex;
     const char* log_col_resp_hex;
+
+    // --- Dispositivo destino / test de arranque (/config y Setup) ---
+    const char* tgt_h3;
+    const char* tgt_note;
+    const char* tgt_profile;
+    const char* tgt_custom;         // etiqueta de la opcion "Custom" del desplegable
+    const char* tgt_custom_warn;    // aviso de responsabilidad al elegir Custom
+    const char* tgt_check;
+    const char* tgt_check_on;
+    const char* tgt_check_off;
+    const char* tgt_unit_id;
+    const char* tgt_unit_note;
+    const char* tgt_func;
+    const char* tgt_func_note;
+    const char* tgt_register;
+    const char* tgt_reg_count;
 };
